@@ -951,6 +951,14 @@ static char causes[GGML_DEFAULT_GRAPH_SIZE*16 + GGML_SCHED_MAX_SPLITS_DEBUG*GGML
 #endif
 
 // returns the backend that should be used for the node based on the current locations
+// Opt-in: GGML_SCHED_GPU_WEIGHT_OFFLOAD=<min batch>. Large-batch matmuls whose weights sit on a secondary GPU (e.g. a slow GTX 1660
+// holding spilled FFN layers) run on the first (fastest) backend instead; the scheduler copies the weights across, as it already does
+// for host-resident weights. Small batches (decode, speculative verify) stay where the weights are. Default off.
+static int ggml_sched_gpu_weight_offload_min_batch() {
+    static const int v = []{ const char * e = getenv("GGML_SCHED_GPU_WEIGHT_OFFLOAD"); return e ? atoi(e) : 0; }();
+    return v;
+}
+
 static int ggml_backend_sched_backend_id_from_cur(ggml_backend_sched_t sched, struct ggml_tensor * tensor) {
     // assign pre-allocated nodes to their backend
     int cur_backend_id = ggml_backend_sched_backend_from_buffer(sched, tensor, tensor);
@@ -1006,6 +1014,15 @@ static int ggml_backend_sched_backend_id_from_cur(ggml_backend_sched_t sched, st
                             SET_CAUSE(tensor, "1.off");
                             return b;
                         }
+                    }
+                }
+                {
+                    const int gwo = ggml_sched_gpu_weight_offload_min_batch();
+                    if (gwo > 0 && sched->op_offload && src_backend_id > 0 && src_backend_id < sched->n_backends - 1 &&
+                        tensor->op == GGML_OP_MUL_MAT && i == 0 && tensor->src[1] != NULL && tensor->src[1]->ne[1] >= gwo) {
+                        // the device rejects ops whose weights live in another device's buffer, but the scheduler copies them over
+                        SET_CAUSE(tensor, "1.gwo");
+                        return 0;
                     }
                 }
                 SET_CAUSE(tensor, "1.wgt%d", i);

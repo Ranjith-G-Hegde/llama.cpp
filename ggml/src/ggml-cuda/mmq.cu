@@ -274,6 +274,25 @@ void ggml_cuda_mul_mat_q(
     ggml_cuda_mul_mat_q_switch_type(ctx, args, stream);
 }
 
+
+// GTX 1650/1660 (TU116/TU117) report compute capability 7.5 but have no tensor cores, so the MMA-based MMQ kernels run far
+// below the card's FP32/FP16/dp4a rate. With GGML_CUDA_TU116_CUBLAS=1, large quantized batches on those cards use the
+// dequantize + FP16 cuBLAS path instead. Default off; other GPUs are never affected.
+static bool ggml_cuda_tu116_cublas() {
+    static const bool env_on = []{ const char * e = getenv("GGML_CUDA_TU116_CUBLAS"); return e && e[0] == '1'; }();
+    if (!env_on) {
+        return false;
+    }
+    static int cached[GGML_CUDA_MAX_DEVICES];   // 0 = unknown, 1 = no, 2 = yes
+    const int id = ggml_cuda_get_device();
+    if (cached[id] == 0) {
+        cudaDeviceProp prop;
+        const bool is16 = cudaGetDeviceProperties(&prop, id) == cudaSuccess && strstr(prop.name, "GTX 16") != nullptr;
+        cached[id] = is16 ? 2 : 1;
+    }
+    return cached[id] == 2;
+}
+
 bool ggml_cuda_should_use_mmq(enum ggml_type type, int cc, int64_t ne11, int64_t n_experts) {
 #ifdef GGML_CUDA_FORCE_CUBLAS
     return false;
@@ -331,6 +350,10 @@ bool ggml_cuda_should_use_mmq(enum ggml_type type, int cc, int64_t ne11, int64_t
         if (smpbo < 48 * 1024) {
             return false;
         }
+    }
+
+    if (cc == GGML_CUDA_CC_TURING && n_experts == 0 && ne11 >= 64 && ggml_cuda_tu116_cublas()) {
+        return false;
     }
 
     if (turing_mma_available(cc)) {

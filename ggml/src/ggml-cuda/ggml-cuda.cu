@@ -74,6 +74,8 @@
 #include "ggml-cuda/fill.cuh"
 #include "ggml-cuda/lightning-indexer.cuh"
 #include "ggml.h"
+#include <mutex>
+#include <unordered_map>
 
 #include <algorithm>
 #include <array>
@@ -832,6 +834,48 @@ static void ggml_backend_cuda_buffer_get_tensor_2d(ggml_backend_buffer_t buffer,
     CUDA_CHECK(cudaStreamSynchronize(cudaStreamPerThread));
 }
 
+
+// Opt-in (GGML_CUDA_PEER_WEIGHT_MIRROR=1): weights that live on a secondary GPU (e.g. a GTX 1660 in a PCIe x4 slot) and are copied to
+// another GPU for large-batch matmuls are mirrored once into pinned host memory; later copies go host -> device over the destination GPU's
+// own (faster) link instead of a peer copy over the slow x4 link. Decode keeps reading the weights from the secondary GPU's VRAM.
+// Read-only weights, so the mirror never goes stale. If pinned allocation fails, the normal peer copy is used.
+static void * ggml_cuda_weight_mirror(const ggml_tensor * src, int src_device) {
+    static const bool enabled = []{ const char * e = getenv("GGML_CUDA_PEER_WEIGHT_MIRROR"); return e && e[0] == '1'; }();
+    if (!enabled) {
+        return nullptr;
+    }
+    ggml_backend_buffer_t buf = src->view_src ? src->view_src->buffer : src->buffer;
+    if (buf == nullptr || buf->usage != GGML_BACKEND_BUFFER_USAGE_WEIGHTS) {
+        return nullptr;
+    }
+    const size_t size = ggml_nbytes(src);
+    if (size < (size_t(1) << 20)) {
+        return nullptr;
+    }
+    static std::mutex mtx;
+    static std::unordered_map<const ggml_tensor *, void *> mirrors;
+    static bool failed = false;
+    std::lock_guard<std::mutex> lock(mtx);
+    auto it = mirrors.find(src);
+    if (it != mirrors.end()) {
+        return it->second;
+    }
+    if (failed) {
+        return nullptr;
+    }
+    void * host = nullptr;
+    if (cudaHostAlloc(&host, size, cudaHostAllocPortable) != cudaSuccess) {
+        (void) cudaGetLastError();
+        failed = true;
+        GGML_LOG_WARN("%s: pinned host allocation of %zu MiB failed, falling back to peer copies\n", __func__, size >> 20);
+        return nullptr;
+    }
+    ggml_cuda_set_device(src_device);
+    CUDA_CHECK(cudaMemcpy(host, src->data, size, cudaMemcpyDeviceToHost));
+    mirrors.emplace(src, host);
+    return host;
+}
+
 static bool ggml_backend_cuda_buffer_cpy_tensor(ggml_backend_buffer_t buffer, const ggml_tensor * src, ggml_tensor * dst) {
     if (ggml_backend_buffer_is_cuda(src->buffer)) {
         ggml_backend_cuda_buffer_context * src_ctx = (ggml_backend_cuda_buffer_context *)src->buffer->context;
@@ -846,7 +890,12 @@ static bool ggml_backend_cuda_buffer_cpy_tensor(ggml_backend_buffer_t buffer, co
 #ifdef GGML_CUDA_NO_PEER_COPY
             return false;
 #else
-            CUDA_CHECK(cudaMemcpyPeerAsync(dst->data, dst_physical, src->data, src_physical, ggml_nbytes(src), cudaStreamPerThread));
+            if (void * mirror = ggml_cuda_weight_mirror(src, src_ctx->device)) {
+                ggml_cuda_set_device(dst_ctx->device);
+                CUDA_CHECK(cudaMemcpyAsync(dst->data, mirror, ggml_nbytes(src), cudaMemcpyHostToDevice, cudaStreamPerThread));
+            } else {
+                CUDA_CHECK(cudaMemcpyPeerAsync(dst->data, dst_physical, src->data, src_physical, ggml_nbytes(src), cudaStreamPerThread));
+            }
 #endif
         }
         CUDA_CHECK(cudaStreamSynchronize(cudaStreamPerThread));
@@ -2583,6 +2632,12 @@ static bool ggml_backend_cuda_cpy_tensor_async(ggml_backend_t backend_src, ggml_
 #ifdef GGML_CUDA_NO_PEER_COPY
             return false;
 #else
+            if (void * mirror = ggml_cuda_weight_mirror(src, buf_ctx_src->device)) {
+                // host -> device on the destination stream: stream ordering replaces the event hand-off below
+                ggml_cuda_set_device(cuda_ctx_dst->device);
+                CUDA_CHECK(cudaMemcpyAsync(dst->data, mirror, ggml_nbytes(dst), cudaMemcpyHostToDevice, cuda_ctx_dst->stream()));
+                return true;
+            }
             CUDA_CHECK(cudaMemcpyPeerAsync(dst->data, dst_physical, src->data, src_physical, ggml_nbytes(dst), cuda_ctx_src->stream()));
 #endif // GGML_CUDA_NO_PEER_COPY
         }
