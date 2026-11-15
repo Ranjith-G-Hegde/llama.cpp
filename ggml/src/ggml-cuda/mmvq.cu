@@ -665,6 +665,7 @@ static __global__ void mul_mat_vec_q(
     const uint32_t nrows_dst = ncols_dst == 1 && ids ? stride_channel_dst : stride_col_dst;
 
     const uint32_t sample_x    = fastdiv(sample_dst, sample_ratio);
+    const uint32_t nrows_dst   = ncols_dst == 1 && ids && !shared_expert ? stride_channel_dst : stride_col_dst;
     const uint32_t sample_y    = sample_dst;
 
     bool use_gate = false;
