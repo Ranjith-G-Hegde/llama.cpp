@@ -1,3 +1,7 @@
+> **This fork** tunes llama.cpp for a 12 GB RTX 40 card + a GTX 16xx helper + 96 GB DDR5 + Zen 4 PC: MoE models with
+> experts in RAM and dense 27B models with layers on a slow second GPU, all full quality. Measured configs, branches
+> and build notes: **[docs/pc/README.md](docs/pc/README.md)**. Everything below is upstream's README.
+
 # llama.cpp
 
 ![llama.cpp](https://raw.githubusercontent.com/ggml-org/llama-brand/refs/heads/master/logo/svg/cover/llama-cpp/cover-llama-cpp-dark.svg)
